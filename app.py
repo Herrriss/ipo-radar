@@ -96,6 +96,26 @@ def normalize_company_name(name):
     s = re.sub(r"[^a-z0-9]", "", s)
     return s
 
+def extract_search_keywords_from_pipeline(us_list, de_list):
+    """Erstellt eine Liste der Kernnamen aller bereits in Tab 1 & Tab 2 gelisteten Unternehmen."""
+    keywords = set()
+    for item in us_list + de_list:
+        raw = item.get("name", "")
+        # Klammerzusätze und Rechtsformen entfernen
+        clean = re.sub(r"\(.*?\)", "", raw)
+        clean = re.sub(r"\b(Inc|Corp|Corporation|Ltd|Limited|LLC|PLC|SE|AG|GmbH|Holdings|Group|Co|SPAC|Acquisition)\.?", "", clean, flags=re.IGNORECASE).strip()
+        
+        # Bei Doppelnamen wie "Klarna / Revolut" beide einzeln aufnehmen
+        for part in clean.split("/"):
+            p = part.strip().lower()
+            if len(p) >= 4:
+                keywords.add(p)
+                # Auch das erste markante Wort aufnehmen (z. B. "autodoc", "stada", "flix", "knds")
+                first_word = p.split()[0]
+                if len(first_word) >= 4:
+                    keywords.add(first_word)
+    return keywords
+
 def parse_sort_date(raw_val):
     now = datetime.now()
     if pd.isna(raw_val) or str(raw_val).strip().lower() in ["", "-", "offen", "n/a", "none", "nan", "tbd", "unscheduled"]:
@@ -298,9 +318,35 @@ def get_de_eu_ipos_full():
     items.sort(key=lambda x: x["sort_dt"])
     return items
 
-# --- NEWS-FUNKTIONEN ---
+# --- NEWS-FUNKTIONEN & QUER-DEDUPLIZIERUNG ---
 
-def parse_rss_feed(url, source_label, cutoff_utc=None, filter_keywords=None, headers=None, lang_flag=""):
+def extract_topic_key(title):
+    stopwords = {
+        "aktien", "aktie", "börse", "börsengang", "ipo", "us", "usa", "dax",
+        "nasdaq", "nyse", "markt", "märkte", "finanzen", "wirtschaft", "update",
+        "analyse", "warum", "wie", "nach", "vor", "neue", "neuer", "neues",
+        "mega", "rekord", "ki", "ai", "tech", "europa", "deutschland", "frankfurt",
+        "erwägt", "plant", "prüft", "vorbereitet", "aktuelle", "news", "handel",
+        "markiert", "stürzt", "richtung", "ausgabekurs", "prozent", "minus", "plus"
+    }
+    words = re.findall(r"\b[A-ZÄÖÜ][a-zA-Z0-9äöüÄÖÜß\-]{2,}\b", title)
+    for w in words:
+        w_low = w.lower()
+        if w_low not in stopwords:
+            return w_low
+    return "allgemein"
+
+def is_recent_ipo_post_market(title):
+    post_ipo_signals = [
+        "nach börsengang", "nach dem börsengang", "nach börsendebüt", "nach rekord-börsengang",
+        "seit börsengang", "ausgabepreis", "ausgabekurs", "erstnotiz", "handelstag",
+        "im minus nach", "im plus nach", "stürzt", "after ipo", "post-ipo", "trading debut",
+        "shares fall", "shares drop", "shares surge", "after debut"
+    ]
+    t_low = title.lower()
+    return any(sig in t_low for sig in post_ipo_signals)
+
+def parse_rss_feed(url, source_label, cutoff_utc=None, title_keywords=None, headers=None, lang_flag=""):
     results = []
     try:
         resp = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=8)
@@ -311,7 +357,6 @@ def parse_rss_feed(url, source_label, cutoff_utc=None, filter_keywords=None, hea
             title = item.find("title").text if item.find("title") is not None else ""
             link = item.find("link").text if item.find("link") is not None else ""
             pub_raw = item.find("pubDate").text if item.find("pubDate") is not None else ""
-            desc = item.find("description").text if item.find("description") is not None else ""
             
             src_tag = item.find("source")
             actual_source = src_tag.text if (src_tag is not None and src_tag.text) else source_label
@@ -327,9 +372,9 @@ def parse_rss_feed(url, source_label, cutoff_utc=None, filter_keywords=None, hea
             except Exception:
                 continue
                 
-            if filter_keywords:
-                text_blob = f"{title} {desc}".lower()
-                if not any(kw in text_blob for kw in filter_keywords):
+            if title_keywords:
+                t_low = title.lower()
+                if not any(kw in t_low for kw in title_keywords):
                     continue
                     
             results.append({
@@ -348,25 +393,16 @@ def parse_rss_feed(url, source_label, cutoff_utc=None, filter_keywords=None, hea
 
 @st.cache_data(ttl=1800)
 def get_company_latest_3_news(company_name, symbol=""):
-    """
-    Holt die 3 aktuellsten Meldungen (in Deutsch UND Englisch) zum jeweiligen
-    Unternehmen – ohne künstliches 14-Tage-Limit, damit auch bei ruhigeren
-    Kandidaten immer die neuesten verfügbaren Infos angezeigt werden.
-    """
     all_articles = []
-    
-    # 1. Deutschsprachige Suche
     q_de = f'"{company_name}" (IPO OR Börsengang OR Aktie OR Börse)'
     url_de = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_de)}&hl=de&gl=DE&ceid=DE:de"
     all_articles.extend(parse_rss_feed(url_de, "DE-News", cutoff_utc=None, lang_flag="🇩🇪"))
     
-    # 2. Englischsprachige Suche (wichtig für US-IPOs & internationale Filings)
     sym_part = f' OR "{symbol}"' if (symbol and symbol != "n/a" and len(symbol) >= 3) else ""
     q_en = f'("{company_name}"{sym_part}) (IPO OR "going public" OR "S-1" OR Nasdaq OR NYSE OR shares)'
     url_en = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_en)}&hl=en-US&gl=US&ceid=US:en"
     all_articles.extend(parse_rss_feed(url_en, "US/EN-News", cutoff_utc=None, lang_flag="🇺🇸"))
     
-    # Deduplizieren & strikt chronologisch sortieren (aktuellste zuerst)
     all_articles.sort(key=lambda x: x["pub_dt"], reverse=True)
     unique = []
     seen = set()
@@ -377,20 +413,25 @@ def get_company_latest_3_news(company_name, symbol=""):
             unique.append(art)
             if len(unique) == 3:
                 break
-                
     return unique
 
 @st.cache_data(ttl=900)
-def get_multi_source_ipo_news(max_days=5):
+def get_balanced_ipo_news(exclude_keywords, max_days=5):
+    """
+    Liefert nur News zu:
+    1. Frisch notierten Börsengängen (max. 6 Artikel – für Nachkauf-Chancen)
+    2. Neuen Gerüchten & Kandidaten, die NOCH NICHT in Tab 1 oder Tab 2 gelistet sind (max. 3 Artikel)
+    """
     now_utc = datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(days=max_days)
     all_news = []
     
-    ipo_keywords = [
+    ipo_title_keywords = [
         "ipo", "börsengang", "börsenpläne", "börsendebüt", "erstnotiz",
-        "zeichnungsfrist", "emissionspreis", "s-1", "going public", "float"
+        "zeichnungsfrist", "emissionspreis", "ausgabekurs", "s-1", "going public", "float", "spinoff", "abspaltung"
     ]
     
+    # 1. Finnhub General Market News API
     try:
         fh_url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}"
         resp = requests.get(fh_url, timeout=8)
@@ -401,8 +442,7 @@ def get_multi_source_ipo_news(max_days=5):
                 if pub_dt < cutoff_utc:
                     continue
                 headline = art.get("headline", "")
-                summary = art.get("summary", "")
-                if any(kw in f"{headline} {summary}".lower() for kw in ipo_keywords):
+                if any(kw in headline.lower() for kw in ipo_title_keywords):
                     all_news.append({
                         "title": headline,
                         "link": art.get("url", ""),
@@ -414,6 +454,7 @@ def get_multi_source_ipo_news(max_days=5):
     except Exception:
         pass
 
+    # 2. Direkte Wirtschafts-RSS-Feeds
     direct_feeds = [
         ("Handelsblatt", "https://www.handelsblatt.com/contentexport/feed/finanzen"),
         ("manager magazin", "https://www.manager-magazin.de/unternehmen/index.rss"),
@@ -421,29 +462,65 @@ def get_multi_source_ipo_news(max_days=5):
         ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories")
     ]
     for label, feed_url in direct_feeds:
-        all_news.extend(parse_rss_feed(feed_url, label, cutoff_utc, filter_keywords=ipo_keywords))
+        all_news.extend(parse_rss_feed(feed_url, label, cutoff_utc, title_keywords=ipo_title_keywords))
 
+    # 3. Streng gefiltertes Google News
     whitelist_query = (
-        '(intitle:Börsengang OR intitle:IPO) '
+        '(intitle:Börsengang OR intitle:IPO OR intitle:Börsenpläne OR intitle:Börsendebüt) '
         '(site:handelsblatt.com OR site:wiwo.de OR site:manager-magazin.de OR site:boersen-zeitung.de OR site:faz.net OR site:finanzen.net) '
-        '-Ratgeber -Rückblick '
+        '-Ratgeber '
         f'when:{max_days}d'
     )
     gn_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(whitelist_query)}&hl=de&gl=DE&ceid=DE:de"
     all_news.extend(parse_rss_feed(gn_url, "Wirtschaftspresse (DE)", cutoff_utc))
 
-    unique_news = []
-    seen_prefixes = set()
     all_news.sort(key=lambda x: x["pub_dt"], reverse=True)
     
+    # Erkennen, welche Unternehmen gerade frisch an die Börse gegangen sind
+    recent_ipo_topics = set()
     for item in all_news:
-        clean_t = re.sub(r"[^a-zA-Z0-9äöüÄÖÜß ]", "", item["title"].lower())
-        prefix = clean_t[:42]
-        if prefix and prefix not in seen_prefixes:
-            seen_prefixes.add(prefix)
-            unique_news.append(item)
+        topic = extract_topic_key(item["title"])
+        if topic != "allgemein" and is_recent_ipo_post_market(item["title"]):
+            recent_ipo_topics.add(topic)
             
-    return unique_news[:30]
+    balanced_news = []
+    seen_prefixes = set()
+    topic_counts = {}
+    
+    for item in all_news:
+        title_low = item["title"].lower()
+        clean_t = re.sub(r"[^a-zA-Z0-9äöüÄÖÜß ]", "", title_low)
+        prefix = clean_t[:42]
+        if not prefix or prefix in seen_prefixes:
+            continue
+            
+        topic = extract_topic_key(item["title"])
+        is_fresh_ipo = topic in recent_ipo_topics
+        
+        # Quer-Deduplizierung: Wenn das Unternehmen schon in Tab 1 oder Tab 2 steht
+        # (und KEIN gerade frisch notiertes Post-IPO ist), hier ausblenden!
+        if not is_fresh_ipo and any(kw in title_low for kw in exclude_keywords):
+            continue
+            
+        current_count = topic_counts.get(topic, 0)
+        limit = 6 if is_fresh_ipo else 3
+        
+        if topic != "allgemein" and current_count >= limit:
+            continue
+            
+        seen_prefixes.add(prefix)
+        topic_counts[topic] = current_count + 1
+        
+        if topic == "allgemein":
+            item["topic_tag"] = "MARKT"
+        elif is_fresh_ipo:
+            item["topic_tag"] = f"🔥 FRISCHES IPO: {topic.upper()}"
+        else:
+            item["topic_tag"] = f"🆕 NEUER KANDIDAT / GERÜCHT: {topic.upper()}"
+            
+        balanced_news.append(item)
+        
+    return balanced_news[:35]
 
 # --- BENUTZEROBERFLÄCHE ---
 
@@ -454,12 +531,17 @@ if st.button("🔄 Daten aktualisieren", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-Pipeline (6 Mon.)", "🇩🇪 DE / EU (inkl. 2027)", "📰 Wirtschafts-News (5 Tage)"])
+# Daten vorab laden, damit Tab 3 weiß, welche Unternehmen schon in Tab 1 & 2 abgedeckt sind
+us_ipos_all = get_us_ipos_full(FINNHUB_API_KEY)
+de_ipos_all = get_de_eu_ipos_full()
+pipeline_exclude_keywords = extract_search_keywords_from_pipeline(us_ipos_all, de_ipos_all)
+
+tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-Pipeline (6 Mon.)", "🇩🇪 DE / EU (inkl. 2027)", "📰 Neue Gerüchte & Frische IPOs (5T)"])
 
 # --- TAB 1: US-IPOs ---
 with tab_us:
     st.subheader("Kommende US-Börsengänge")
-    us_ipos = get_us_ipos_full(FINNHUB_API_KEY)
+    us_ipos = us_ipos_all
     
     if not us_ipos:
         st.info("Aktuell keine zukünftigen US-IPOs im 6-Monats-Fenster gemeldet.")
@@ -513,7 +595,7 @@ with tab_de:
     st.subheader("Geplante Börsengänge (DE / Europa)")
     st.markdown("🔗 [Onvista IPO-Kandidaten ↗](https://www.onvista.de/aktien/ipos)  |  [Börse Frankfurt Zeichnungen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
     
-    de_ipos = get_de_eu_ipos_full()
+    de_ipos = de_ipos_all
     st.caption(f"{len(de_ipos)} geplante bzw. bekannte DE/EU-Börsenkandidaten (chronologisch nach erwartetem Fenster):")
     
     for item in de_ipos:
@@ -543,22 +625,32 @@ with tab_de:
                 else:
                     st.caption("Keine aktuellen Meldungen gefunden.")
 
-# --- TAB 3: MULTI-QUELLEN WIRTSCHAFTS-NEWS (LETZTE 5 TAGE) ---
+# --- TAB 3: NUR NEUE GERÜCHTE & FRISCHE BÖRSENGÄNGE ---
 with tab_news:
-    st.subheader("Wirtschafts-News & IPO-Pläne (letzte 5 Tage)")
-    st.caption("Quellen: Finnhub (Reuters/Bloomberg), Handelsblatt, manager magazin, CNBC, MarketWatch & gefilterte Wirtschaftspresse:")
+    st.subheader("Neue Gerüchte & Frische Börsengänge (5 Tage)")
+    st.caption("Bereits in Tab 1 & 2 gelistete Pipeline-Unternehmen sind hier ausgeblendet – Fokus auf neue Kandidaten (max. 3) & Nachkauf-Chancen nach Debüt (max. 6):")
     
-    all_news = get_multi_source_ipo_news(max_days=5)
+    all_news = get_balanced_ipo_news(tuple(sorted(pipeline_exclude_keywords)), max_days=5)
     
     if not all_news:
-        st.info("In den letzten 5 Tagen gab es keine neuen IPO-Meldungen in den angeschlossenen Wirtschaftsmedien.")
+        st.info("In den letzten 5 Tagen gab es keine neuen Meldungen außerhalb deiner bestehenden Tab-1/Tab-2-Pipeline.")
     else:
-        categories = ["Alle Quellen"] + sorted(list({n["category"] for n in all_news}))
-        selected_cat = st.selectbox("Quelle filtern:", categories, key="news_source_filter")
-        
-        filtered_news = all_news if selected_cat == "Alle Quellen" else [n for n in all_news if n["category"] == selected_cat]
-        
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            categories = ["Alle Quellen"] + sorted(list({n["category"] for n in all_news}))
+            selected_cat = st.selectbox("Quelle filtern:", categories, key="news_source_filter")
+        with col_f2:
+            type_filter = st.selectbox("Kategorie filtern:", ["Alle", "🔥 Nur frische IPOs (max. 6)", "🆕 Nur neue Kandidaten & Gerüchte (max. 3)"])
+            
+        filtered_news = all_news
+        if selected_cat != "Alle Quellen":
+            filtered_news = [n for n in filtered_news if n["category"] == selected_cat]
+        if type_filter == "🔥 Nur frische IPOs (max. 6)":
+            filtered_news = [n for n in filtered_news if "FRISCHES IPO" in n["topic_tag"]]
+        elif type_filter == "🆕 Nur neue Kandidaten & Gerüchte (max. 3)":
+            filtered_news = [n for n in filtered_news if "NEUER KANDIDAT" in n["topic_tag"]]
+            
         for item in filtered_news:
             with st.container(border=True):
-                st.caption(f"📰 **{item['source']}** ({item['category']}) • {item['datetime_fmt']}")
+                st.caption(f"`{item['topic_tag']}` • 📰 **{item['source']}** ({item['category']}) • {item['datetime_fmt']}")
                 st.markdown(f"**[{item['title']}]({item['link']})**")
