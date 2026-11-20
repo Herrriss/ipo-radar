@@ -10,10 +10,39 @@ import re
 
 # --- SEITEN-KONFIGURATION ---
 st.set_page_config(
-    page_title="IPO Radar – Zukunfts-Pipeline",
+    page_title="IPO-Radar",
     page_icon="🔭",
     layout="centered"
 )
+
+# --- KOMPAKTES MOBILE-LAYOUT (Mehr Platz oben & keine abgeschnittenen Tabs) ---
+st.markdown("""
+    <style>
+        /* Oberen weißen Leerraum stark reduzieren */
+        .block-container {
+            padding-top: 1.2rem !important;
+            padding-bottom: 2rem !important;
+            padding-left: 0.9rem !important;
+            padding-right: 0.9rem !important;
+        }
+        /* Streamlit-eigene Fork-/Toolbar-Leiste oben ausblenden */
+        header[data-testid="stHeader"] {
+            height: 0px !important;
+            visibility: hidden;
+        }
+        /* Hauptüberschrift kompakt & einzeilig auf dem Handy */
+        h1 {
+            font-size: 1.65rem !important;
+            padding-top: 0rem !important;
+            margin-bottom: 0.2rem !important;
+        }
+        /* Zweite Überschriften ("Kommende US-Börsengänge") etwas platzsparender */
+        h2, h3 {
+            font-size: 1.25rem !important;
+            padding-top: 0.3rem !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 try:
     FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
@@ -101,16 +130,13 @@ def extract_search_keywords_from_pipeline(us_list, de_list):
     keywords = set()
     for item in us_list + de_list:
         raw = item.get("name", "")
-        # Klammerzusätze und Rechtsformen entfernen
         clean = re.sub(r"\(.*?\)", "", raw)
         clean = re.sub(r"\b(Inc|Corp|Corporation|Ltd|Limited|LLC|PLC|SE|AG|GmbH|Holdings|Group|Co|SPAC|Acquisition)\.?", "", clean, flags=re.IGNORECASE).strip()
         
-        # Bei Doppelnamen wie "Klarna / Revolut" beide einzeln aufnehmen
         for part in clean.split("/"):
             p = part.strip().lower()
             if len(p) >= 4:
                 keywords.add(p)
-                # Auch das erste markante Wort aufnehmen (z. B. "autodoc", "stada", "flix", "knds")
                 first_word = p.split()[0]
                 if len(first_word) >= 4:
                     keywords.add(first_word)
@@ -321,15 +347,19 @@ def get_de_eu_ipos_full():
 # --- NEWS-FUNKTIONEN & QUER-DEDUPLIZIERUNG ---
 
 def extract_topic_key(title):
+    """Erkennt den Haupt-Akteur in der Schlagzeile (auch bei Bindestrich-Komposita wie 'Anthropic-Börsengang')."""
     stopwords = {
         "aktien", "aktie", "börse", "börsengang", "ipo", "us", "usa", "dax",
         "nasdaq", "nyse", "markt", "märkte", "finanzen", "wirtschaft", "update",
         "analyse", "warum", "wie", "nach", "vor", "neue", "neuer", "neues",
         "mega", "rekord", "ki", "ai", "tech", "europa", "deutschland", "frankfurt",
         "erwägt", "plant", "prüft", "vorbereitet", "aktuelle", "news", "handel",
-        "markiert", "stürzt", "richtung", "ausgabekurs", "prozent", "minus", "plus"
+        "markiert", "stürzt", "richtung", "ausgabekurs", "prozent", "minus", "plus",
+        "today", "podcast", "ist", "anti", "proteste", "industrielle"
     }
-    words = re.findall(r"\b[A-ZÄÖÜ][a-zA-Z0-9äöüÄÖÜß\-]{2,}\b", title)
+    # Bindestriche aufbrechen, damit aus "Anthropic-Börsengang" das Wort "Anthropic" extrahiert wird
+    cleaned_title = re.sub(r"[-–—:]", " ", title)
+    words = re.findall(r"\b[A-ZÄÖÜ][a-zA-Z0-9äöüÄÖÜß]{2,}\b", cleaned_title)
     for w in words:
         w_low = w.lower()
         if w_low not in stopwords:
@@ -340,8 +370,8 @@ def is_recent_ipo_post_market(title):
     post_ipo_signals = [
         "nach börsengang", "nach dem börsengang", "nach börsendebüt", "nach rekord-börsengang",
         "seit börsengang", "ausgabepreis", "ausgabekurs", "erstnotiz", "handelstag",
-        "im minus nach", "im plus nach", "stürzt", "after ipo", "post-ipo", "trading debut",
-        "shares fall", "shares drop", "shares surge", "after debut"
+        "im minus nach", "im plus nach", "stürzt", "kursabsturz", "after ipo", "post-ipo",
+        "trading debut", "shares fall", "shares drop", "shares surge", "after debut"
     ]
     t_low = title.lower()
     return any(sig in t_low for sig in post_ipo_signals)
@@ -417,11 +447,6 @@ def get_company_latest_3_news(company_name, symbol=""):
 
 @st.cache_data(ttl=900)
 def get_balanced_ipo_news(exclude_keywords, max_days=5):
-    """
-    Liefert nur News zu:
-    1. Frisch notierten Börsengängen (max. 6 Artikel – für Nachkauf-Chancen)
-    2. Neuen Gerüchten & Kandidaten, die NOCH NICHT in Tab 1 oder Tab 2 gelistet sind (max. 3 Artikel)
-    """
     now_utc = datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(days=max_days)
     all_news = []
@@ -497,8 +522,6 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
         topic = extract_topic_key(item["title"])
         is_fresh_ipo = topic in recent_ipo_topics
         
-        # Quer-Deduplizierung: Wenn das Unternehmen schon in Tab 1 oder Tab 2 steht
-        # (und KEIN gerade frisch notiertes Post-IPO ist), hier ausblenden!
         if not is_fresh_ipo and any(kw in title_low for kw in exclude_keywords):
             continue
             
@@ -524,8 +547,8 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
 
 # --- BENUTZEROBERFLÄCHE ---
 
-st.title("🔭 IPO-Radar (Zukunfts-Pipeline)")
-st.caption(f"Stand: {datetime.now().strftime('%d.%m.%Y, %H:%M Uhr')} • Fokus: Nächste 6 Monate & Kandidaten 2027")
+st.title("🔭 IPO-Radar")
+st.caption(f"Stand: {datetime.now().strftime('%d.%m.%Y, %H:%M Uhr')} • Ausblick 6 Mon. & 2027")
 
 if st.button("🔄 Daten aktualisieren", use_container_width=True):
     st.cache_data.clear()
@@ -536,7 +559,7 @@ us_ipos_all = get_us_ipos_full(FINNHUB_API_KEY)
 de_ipos_all = get_de_eu_ipos_full()
 pipeline_exclude_keywords = extract_search_keywords_from_pipeline(us_ipos_all, de_ipos_all)
 
-tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-Pipeline (6 Mon.)", "🇩🇪 DE / EU (inkl. 2027)", "📰 Neue Gerüchte & Frische IPOs (5T)"])
+tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-IPOs", "🇩🇪 DE / EU", "📰 News & Gerüchte"])
 
 # --- TAB 1: US-IPOs ---
 with tab_us:
@@ -627,8 +650,8 @@ with tab_de:
 
 # --- TAB 3: NUR NEUE GERÜCHTE & FRISCHE BÖRSENGÄNGE ---
 with tab_news:
-    st.subheader("Neue Gerüchte & Frische Börsengänge (5 Tage)")
-    st.caption("Bereits in Tab 1 & 2 gelistete Pipeline-Unternehmen sind hier ausgeblendet – Fokus auf neue Kandidaten (max. 3) & Nachkauf-Chancen nach Debüt (max. 6):")
+    st.subheader("Neue Gerüchte & Frische IPOs (5 Tage)")
+    st.caption("Pipeline-Unternehmen aus Tab 1 & 2 sind ausgeblendet – Fokus auf neue Kandidaten (max. 3) & Nachkauf-Chancen nach Debüt (max. 6):")
     
     all_news = get_balanced_ipo_news(tuple(sorted(pipeline_exclude_keywords)), max_days=5)
     
