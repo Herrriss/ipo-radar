@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import io
 import urllib.parse
+import re
 
 # --- SEITEN-KONFIGURATION ---
 st.set_page_config(
@@ -13,7 +14,6 @@ st.set_page_config(
     layout="centered"
 )
 
-# API Key sicher aus Streamlit Secrets laden
 try:
     FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
 except Exception:
@@ -23,87 +23,131 @@ except Exception:
 
 def clean_val(val, suffix=""):
     """Gibt 'n/a' zurück, wenn ein Wert fehlt, ansonsten den formatierten Wert."""
-    if pd.isna(val) or str(val).strip() in ["", "-", "n.v.", "None", "nan", "0", "0.0"]:
+    if pd.isna(val) or str(val).strip().lower() in ["", "-", "n.v.", "n/a", "none", "nan", "0", "0.0", "tbd"]:
         return "n/a"
     if isinstance(val, (int, float)):
         formatted = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"{formatted} {suffix}".strip()
     return f"{str(val).strip()} {suffix}".strip()
 
-def parse_sort_date(date_str):
+def parse_sort_date(raw_val):
     """
-    Wandelt bekannte Daten in ein echtes Datum um.
-    Fehlt ein genaues Datum (z. B. nur Quartal oder 'n/a'), wird ein geschätztes Datum
-    in der Zukunft vergeben, damit die chronologische Sortierung erhalten bleibt.
+    Erkennt echte Daten (auch wenn Pandas Punkte entfernt hat wie 1092026 -> 01.09.2026)
+    und sortiert unbekannte Termine sauber ans Ende des 6-Monats-Horizonts.
     """
     now = datetime.now()
-    if not date_str or str(date_str).strip().lower() in ["", "-", "offen", "n/a", "none", "nan"]:
-        # Ohne Datum -> geschätzt ans Ende des 6-Monats-Horizonts sortieren
-        return now + timedelta(days=175), "n/a (Zeitpunkt offen)"
+    if pd.isna(raw_val) or str(raw_val).strip().lower() in ["", "-", "offen", "n/a", "none", "nan", "tbd", "unscheduled"]:
+        return now + timedelta(days=175), "n/a (Termin offen)"
     
-    s = str(date_str).strip()
-    # Standard-Formate prüfen (YYYY-MM-DD oder DD.MM.YYYY)
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+    s = str(raw_val).strip()
+    
+    # Fix für Pandas-Zahlen ohne Punkte (z. B. 1092026 -> 01.09.2026 oder 30072026 -> 30.07.2026)
+    if re.fullmatch(r"\d{7,8}", s):
+        s_padded = s.zfill(8)
+        s = f"{s_padded[:2]}.{s_padded[2:4]}.{s_padded[4:]}"
+        
+    # Standard-Datumsformate prüfen (inkl. US-Format wie "Nov 25, 2026")
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%b %d, %Y", "%B %d, %Y"):
         try:
             dt = datetime.strptime(s, fmt)
             return dt, dt.strftime("%d.%m.%Y")
         except ValueError:
             pass
             
-    # Falls nur ein Quartal angegeben ist (z. B. "Q1 2027" oder "Q2")
+    # Quartale erkennen (z. B. Q1 2027)
     s_upper = s.upper()
     year = now.year + 1 if str(now.year + 1) in s_upper else now.year
-    if "Q1" in s_upper:
-        return datetime(year, 3, 15), f"~ {s} (geschätzt)"
-    if "Q2" in s_upper:
-        return datetime(year, 6, 15), f"~ {s} (geschätzt)"
-    if "Q3" in s_upper:
-        return datetime(year, 9, 15), f"~ {s} (geschätzt)"
-    if "Q4" in s_upper:
-        return datetime(year, 12, 15), f"~ {s} (geschätzt)"
-        
+    for q, (m, d) in [("Q1", (3, 15)), ("Q2", (6, 15)), ("Q3", (9, 15)), ("Q4", (12, 15))]:
+        if q in s_upper:
+            return datetime(year, m, d), f"~ {s} (geschätzt)"
+            
     return now + timedelta(days=170), f"~ {s} (geschätzt)"
 
 # --- DATEN-FUNKTIONEN ---
 
 @st.cache_data(ttl=1800)
-def get_us_ipos_future(api_key):
+def get_us_ipos_full(api_key):
+    """Kombiniert terminierte US-IPOs (Finnhub) + unbestätigte S-1 Filings (Stock Analysis)."""
     now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-    future_str = (now + timedelta(days=180)).strftime("%Y-%m-%d")
-    url = f"https://finnhub.io/api/v1/calendar/ipo?from={today_str}&to={future_str}&token={api_key}"
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    horizon_end = now + timedelta(days=180)
     
+    combined = {}
+    
+    # 1. Finnhub API (fest terminierte IPOs)
+    url_fh = f"https://finnhub.io/api/v1/calendar/ipo?from={now.strftime('%Y-%m-%d')}&to={horizon_end.strftime('%Y-%m-%d')}&token={api_key}"
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json().get("ipoCalendar", [])
-        if not data:
-            return []
-        
-        processed = []
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        for item in data:
-            sort_dt, display_date = parse_sort_date(item.get("date"))
-            # Nur zukünftige oder heutige Termine behalten (keine Vergangenheit!)
-            if sort_dt < today_start:
-                continue
-                
-            item["sort_dt"] = sort_dt
-            item["display_date"] = display_date
-            processed.append(item)
-            
-        # Chronologisch aufsteigend sortieren (nächste Termine zuerst, geschätzte danach)
-        processed.sort(key=lambda x: x["sort_dt"])
-        return processed
-    except Exception as e:
-        st.error(f"Fehler beim Laden der US-IPOs: {e}")
-        return []
+        resp = requests.get(url_fh, timeout=10)
+        if resp.status_code == 200:
+            for item in resp.json().get("ipoCalendar", []):
+                sort_dt, display_date = parse_sort_date(item.get("date"))
+                if sort_dt >= today_start:
+                    sym = clean_val(item.get("symbol"))
+                    key = sym if sym != "n/a" else item.get("name", "")
+                    shares_raw = item.get("numberOfShares", 0)
+                    shares = f"{int(shares_raw):,} Stück".replace(",", ".") if (pd.notna(shares_raw) and shares_raw > 0) else "n/a"
+                    combined[key] = {
+                        "name": item.get("name") or "n/a",
+                        "symbol": sym,
+                        "sort_dt": sort_dt,
+                        "display_date": display_date,
+                        "exchange": clean_val(item.get("exchange")),
+                        "price": clean_val(item.get("price"), "$"),
+                        "shares": shares,
+                        "status": clean_val(item.get("status", "Terminiert"))
+                    }
+    except Exception:
+        pass
+
+    # 2. Stock Analysis (Kalender + Unscheduled Filings für die volle 6-Monats-Pipeline)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for sa_url, default_status in [
+        ("https://stockanalysis.com/ipos/calendar/", "Terminiert"),
+        ("https://stockanalysis.com/ipos/filings/", "Prospekt eingereicht (S-1)")
+    ]:
+        try:
+            resp = requests.get(sa_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                tables = pd.read_html(io.StringIO(resp.text))
+                for t in tables:
+                    cols = {str(c).lower(): c for c in t.columns}
+                    if "symbol" in cols and ("company name" in cols or "name" in cols):
+                        name_col = cols.get("company name") or cols.get("name")
+                        date_col = cols.get("ipo date") or cols.get("filing date")
+                        price_col = cols.get("price range")
+                        shares_col = cols.get("shares")
+                        
+                        for _, row in t.head(25).iterrows():
+                            sym = clean_val(row.get(cols["symbol"]))
+                            if sym in combined:
+                                continue  # Bereits über Finnhub geladen
+                            
+                            raw_d = row.get(date_col) if "ipo date" in cols else "n/a"
+                            sort_dt, display_date = parse_sort_date(raw_d)
+                            if sort_dt < today_start:
+                                continue
+                                
+                            combined[sym] = {
+                                "name": clean_val(row.get(name_col)),
+                                "symbol": sym,
+                                "sort_dt": sort_dt,
+                                "display_date": display_date,
+                                "exchange": "NASDAQ / NYSE",
+                                "price": clean_val(row.get(price_col)),
+                                "shares": clean_val(row.get(shares_col), "Stück"),
+                                "status": default_status
+                            }
+        except Exception:
+            pass
+
+    result = list(combined.values())
+    result.sort(key=lambda x: x["sort_dt"])
+    return result
 
 @st.cache_data(ttl=3600)
 def get_de_ipos_future():
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"
     }
     ipo_headers = ["wkn", "isin", "termin", "emissions", "zeichnungs", "erstnotiz", "status", "preisspanne"]
@@ -119,14 +163,15 @@ def get_de_ipos_future():
         try:
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
-                tables = pd.read_html(io.StringIO(resp.text), decimal=",", thousands=".")
+                # Wichtig: KEIN thousands="." hier, damit Datums-Punkte nicht zerstört werden!
+                tables = pd.read_html(io.StringIO(resp.text))
                 for t in tables:
                     cols_str = " ".join([str(c).lower() for c in t.columns])
                     if any(h in cols_str for h in ipo_headers) and len(t) > 0:
                         for _, row in t.iterrows():
                             raw_date = row.get("Erstnotiz") or row.get("Termin") or ""
                             sort_dt, display_date = parse_sort_date(raw_date)
-                            # Strikter Filter: Alles aus der Vergangenheit ignorieren!
+                            # Jetzt greift der Vergangenheitsfilter sauber!
                             if sort_dt >= today_start:
                                 future_items.append({
                                     "name": row.get("Name") or row.get("Unternehmen") or "n/a",
@@ -181,36 +226,33 @@ if st.button("🔄 Daten aktualisieren", use_container_width=True):
 
 tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-Pipeline (6 Mon.)", "🇩🇪 DE / EU-Ausblick", "📰 Markt & Gerüchte"])
 
-# --- TAB 1: US-IPOs (NUR ZUKUNFT, CHRONOLOGISCH + RESEARCH-BOX) ---
+# --- TAB 1: US-IPOs ---
 with tab_us:
     st.subheader("Kommende US-Börsengänge")
-    us_ipos = get_us_ipos_future(FINNHUB_API_KEY)
+    us_ipos = get_us_ipos_full(FINNHUB_API_KEY)
     
     if not us_ipos:
         st.info("Aktuell keine zukünftigen US-IPOs im 6-Monats-Fenster gemeldet.")
     else:
-        # Filter nach Status (z. B. expected = terminiert, filed = Prospekt eingereicht)
         all_statuses = sorted(list({item.get("status", "n/a") for item in us_ipos if item.get("status")}))
         selected_status = st.selectbox("Phase / Status filtern:", ["Alle"] + all_statuses)
         
         if selected_status != "Alle":
             us_ipos = [i for i in us_ipos if i.get("status") == selected_status]
             
-        st.caption(f"{len(us_ipos)} geplante Börsengänge gefunden (nächste Termine zuerst):")
+        st.caption(f"{len(us_ipos)} geplante Börsengänge in der Pipeline (chronologisch sortiert):")
         
         for item in us_ipos:
-            name = item.get("name") or "n/a"
-            symbol = clean_val(item.get("symbol"))
-            display_date = item.get("display_date", "n/a")
-            exchange = clean_val(item.get("exchange"))
-            status = clean_val(item.get("status"))
-            price = clean_val(item.get("price"), "$")
-            
-            shares_raw = item.get("numberOfShares", 0)
-            shares = f"{int(shares_raw):,} Stück".replace(",", ".") if (pd.notna(shares_raw) and shares_raw > 0) else "n/a"
+            name = item["name"]
+            symbol = item["symbol"]
+            display_date = item["display_date"]
+            exchange = item["exchange"]
+            status = item["status"]
+            price = item["price"]
+            shares = item["shares"]
             
             with st.container(border=True):
-                col1, col2 = st.columns([3, 1.3])
+                col1, col2 = st.columns([2.8, 1.4])
                 with col1:
                     st.markdown(f"**{name}** (`{symbol}`)")
                 with col2:
@@ -219,28 +261,24 @@ with tab_us:
                 st.markdown(f"🏛️ **Börse:** {exchange}  |  🏷️ **Status:** `{status}`")
                 st.markdown(f"💵 **Preisspanne:** {price}  |  📊 **Volumen:** {shares}")
                 
-                # Aufklappbare Research-Box für Investment-Entscheidung
                 with st.expander("🔍 Unternehmens- & Markt-Research"):
                     clean_company = name.replace("Inc.", "").replace("Corp.", "").replace("Ltd.", "").strip()
-                    
-                    # Direkt-Links zu Primärquellen
                     links = []
                     if symbol != "n/a":
                         links.append(f"[Stock Analysis (Finanzen & Underwriters) ↗](https://stockanalysis.com/stocks/{symbol.lower()}/)")
-                        links.append(f"[SEC-Börsenprospekt (S-1 Filings) ↗](https://www.sec.gov/edgar/searchedgar/companysearch?q={urllib.parse.quote(clean_company)})")
-                    links.append(f"[Google News Suche ↗](https://news.google.com/search?q={urllib.parse.quote(clean_company + ' IPO')})")
+                        links.append(f"[SEC-Börsenprospekt (S-1) ↗](https://www.sec.gov/edgar/searchedgar/companysearch?q={urllib.parse.quote(clean_company)})")
+                    links.append(f"[Google News ↗](https://news.google.com/search?q={urllib.parse.quote(clean_company + ' IPO')})")
                     st.markdown(" • ".join(links))
                     
-                    # Live-News speziell zu diesem Unternehmen
                     st.markdown(f"**Aktuelle Meldungen zu {clean_company}:**")
                     company_news = get_news_feed(f'"{clean_company}" IPO OR Börsengang', max_items=3)
                     if company_news:
                         for n in company_news:
                             st.markdown(f"- [{n['title']}]({n['link']}) *({n['source']}, {n['date'][:16]})*")
                     else:
-                        st.caption("Keine aktuellen deutschsprachigen Schlagzeilen – nutze den Google News / Stock Analysis Link oben.")
+                        st.caption("Keine aktuellen deutschsprachigen Schlagzeilen – nutze die Links oben für US-Analysen.")
 
-# --- TAB 2: DE / EUROPA (NUR ZUKUNFT + KANDIDATEN-PIPELINE) ---
+# --- TAB 2: DE / EUROPA ---
 with tab_de:
     st.subheader("Geplante Börsengänge (DE / Europa)")
     st.markdown("🔗 [Onvista IPO-Kandidaten ↗](https://www.onvista.de/aktien/ipos)  |  [Börse Frankfurt Zeichnungen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
@@ -249,7 +287,7 @@ with tab_de:
     if de_ipos:
         for item in de_ipos:
             with st.container(border=True):
-                col1, col2 = st.columns([3, 1.3])
+                col1, col2 = st.columns([2.8, 1.4])
                 with col1:
                     st.markdown(f"**{item['name']}** (`WKN: {item['wkn']}`)")
                 with col2:
@@ -263,7 +301,7 @@ with tab_de:
                     for n in c_news:
                         st.markdown(f"- [{n['title']}]({n['link']}) *({n['source']})*")
     else:
-        st.info("In den öffentlichen Kalendertabellen steht heute noch kein neuer deutscher Börsengang mit festem Datum. Unten siehst du aktuelle Ankündigungen und Kandidaten in der Vorbereitung:")
+        st.info("In den öffentlichen Kalendertabellen steht aktuell noch kein neuer deutscher Börsengang mit festem zukünftigen Datum. Unten siehst du aktuelle Ankündigungen und Kandidaten in der Vorbereitung:")
     
     st.markdown("---")
     st.markdown("**🇩🇪 Pipeline & Ankündigungen (DE / Europa):**")
