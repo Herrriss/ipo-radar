@@ -42,33 +42,49 @@ def get_us_ipos(api_key):
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
-def get_onvista_ipos():
-    url = "https://www.onvista.de/aktien/ipos"
+def get_de_ipos():
+    # Wir versuchen zuerst boerse.de (meist ohne 403-Sperre) und nutzen realistische Browser-Header
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.de/"
     }
+    
+    # Quelle 1: boerse.de IPO-Kalender
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        # Fix: io.StringIO verhindert den "File name too long"-Fehler in neueren Pandas-Versionen
-        tables = pd.read_html(io.StringIO(response.text))
-        if tables:
-            return tables[0]
-        return pd.DataFrame()
-    except Exception as e:
-        return pd.DataFrame({"Hinweis": [f"Onvista-Tabelle aktuell nicht direkt auslesbar ({e})."]})
+        resp = requests.get("https://www.boerse.de/ipos/", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            tables = pd.read_html(io.StringIO(resp.text))
+            for t in tables:
+                if len(t.columns) >= 3 and len(t) > 0:
+                    return t, "boerse.de"
+    except Exception:
+        pass
+
+    # Quelle 2: finanzen.net IPO-Kalender als Backup
+    try:
+        resp = requests.get("https://www.finanzen.net/ipo/", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            tables = pd.read_html(io.StringIO(resp.text))
+            for t in tables:
+                if len(t.columns) >= 3 and len(t) > 0:
+                    return t, "finanzen.net"
+    except Exception:
+        pass
+
+    return pd.DataFrame(), None
 
 @st.cache_data(ttl=900)
-def get_ipo_news():
-    # Stabiler deutscher News-Feed (bündelt Onvista, Handelsblatt, dpa-AFX, Börse Online)
-    rss_url = "https://news.google.com/rss/search?q=B%C3%B6rsengang+OR+IPO+Aktie&hl=de&gl=DE&ceid=DE:de"
+def get_ipo_news(query="B%C3%B6rsengang+OR+IPO+Aktie"):
+    rss_url = f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
     news_items = []
     
     try:
         response = requests.get(rss_url, timeout=10)
         response.raise_for_status()
         root = ET.fromstring(response.content)
-        for item in root.findall(".//item")[:20]:  # Die 20 aktuellsten Meldungen
+        for item in root.findall(".//item")[:20]:
             title = item.find("title").text if item.find("title") is not None else ""
             link = item.find("link").text if item.find("link") is not None else ""
             pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
@@ -141,16 +157,25 @@ with tab_us:
                     sa_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/"
                     st.markdown(f"🏦 [Konsortialbanken & Details auf Stock Analysis prüfen ↗]({sa_url})")
 
-# --- TAB 2: DE / EUROPA (ONVISTA) ---
+# --- TAB 2: DE / EUROPA ---
 with tab_de:
-    st.subheader("Geplante Börsengänge (Onvista)")
-    st.markdown("🔗 [Direkt zur Onvista IPO-Übersicht ↗](https://www.onvista.de/aktien/ipos)")
+    st.subheader("Geplante Börsengänge (DE / EU)")
+    st.markdown("🔗 [Onvista IPO-Übersicht öffnen ↗](https://www.onvista.de/aktien/ipos) | [Börse Frankfurt Neuemissionen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
     
-    df_onvista = get_onvista_ipos()
-    if not df_onvista.empty:
-        st.dataframe(df_onvista, use_container_width=True, hide_index=True)
+    df_de, source_name = get_de_ipos()
+    if not df_de.empty:
+        st.caption(f"Quelle: {source_name}")
+        st.dataframe(df_de, use_container_width=True, hide_index=True)
     else:
-        st.warning("Aktuell keine Tabellendaten auf Onvista gefunden.")
+        st.info("Direkte Tabellendaten werden aktuell durch Firewall geschützt – nutze die Schnell-Links oben oder die gefilterten DE-IPO-News unten:")
+    
+    st.markdown("---")
+    st.markdown("**🇩🇪 Aktuelle Meldungen zu deutschen & europäischen Börsengängen:**")
+    de_news = get_ipo_news(query="B%C3%B6rsengang+Frankfurt+OR+Zeichnungsfrist+Aktie+OR+IPO+Deutschland")
+    for item in de_news[:8]:
+        with st.container(border=True):
+            st.caption(f"{item['source']} • {item['date']}")
+            st.markdown(f"**[{item['title']}]({item['link']})**")
 
 # --- TAB 3: NEWS-TICKER ---
 with tab_news:
