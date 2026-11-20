@@ -1,12 +1,11 @@
 import streamlit as st
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import io
 
-# --- SEITEN-KONFIGURATION (Mobilfreundlich) ---
+# --- SEITEN-KONFIGURATION (Optimal für Smartphone & Desktop) ---
 st.set_page_config(
     page_title="IPO Radar",
     page_icon="📈",
@@ -18,6 +17,17 @@ try:
     FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
 except Exception:
     FINNHUB_API_KEY = "dc03iq1r01qgh2a7ms80dc03iq1r01qgh2a7ms8g"
+
+# --- HELFER-FUNKTIONEN ---
+
+def format_de_number(val, suffix=""):
+    """Formatiert Zahlen sauber ins deutsche Format (z. B. 1.234,56 €)."""
+    if pd.isna(val) or str(val).strip() in ["", "-", "n.v.", "None"]:
+        return "Offen"
+    if isinstance(val, (int, float)):
+        formatted = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{formatted} {suffix}".strip()
+    return f"{val} {suffix}".strip()
 
 # --- DATEN-FUNKTIONEN ---
 
@@ -50,9 +60,7 @@ def get_de_ipos():
         "Referer": "https://www.google.de/"
     }
     
-    # Begriffe, die in einer echten IPO-Tabelle als Spaltenkopf vorkommen müssen (verhindert Seitenleisten-Tabellen wie BCDI)
     ipo_headers = ["wkn", "isin", "termin", "emissions", "zeichnungs", "erstnotiz", "status", "preisspanne"]
-    
     sources = [
         ("boerse.de", "https://www.boerse.de/ipos/"),
         ("finanzen.net", "https://www.finanzen.net/ipo/")
@@ -62,10 +70,9 @@ def get_de_ipos():
         try:
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
-                tables = pd.read_html(io.StringIO(resp.text))
+                tables = pd.read_html(io.StringIO(resp.text), decimal=",", thousands=".")
                 for t in tables:
                     cols_str = " ".join([str(c).lower() for c in t.columns])
-                    # Nur Tabellen akzeptieren, die echte IPO-Spaltenüberschriften haben
                     if any(h in cols_str for h in ipo_headers) and len(t) > 0:
                         return t, source_name
         except Exception:
@@ -99,7 +106,7 @@ def get_ipo_news(query="B%C3%B6rsengang+OR+IPO+Aktie"):
         st.error(f"News-Feed konnte nicht geladen werden: {e}")
         return []
 
-# --- BENUTZEROBERFLÄCHE (MOBILE-FIRST) ---
+# --- BENUTZEROBERFLÄCHE (EINHEITLICHES KARTEN-DESIGN) ---
 
 st.title("📈 Mein IPO-Radar")
 st.caption(f"Stand: {datetime.now().strftime('%d.%m.%Y, %H:%M Uhr')}")
@@ -110,7 +117,7 @@ if st.button("🔄 Daten aktualisieren", use_container_width=True):
 
 tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-IPOs", "🇩🇪 DE / Europa", "📰 IPO-News"])
 
-# --- TAB 1: US-IPOs ---
+# --- TAB 1: US-IPOs (KARTEN-DESIGN) ---
 with tab_us:
     st.subheader("Anstehende US-Börsengänge")
     df_us = get_us_ipos(FINNHUB_API_KEY)
@@ -129,7 +136,7 @@ with tab_us:
             symbol = row.get("symbol", "-")
             date_str = row.get("date", "Offen")
             exchange = row.get("exchange", "-")
-            price = row.get("price", "Keine Angabe")
+            price = row.get("price", "")
             shares = row.get("numberOfShares", 0)
             status = row.get("status", "-")
             
@@ -139,33 +146,68 @@ with tab_us:
                 date_fmt = date_str
 
             with st.container(border=True):
+                # Kopfzeile: Name, Ticker & Datum
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.markdown(f"**{name}** (`{symbol}`)")
                 with col2:
                     st.markdown(f"📅 **{date_fmt}**")
                 
-                st.markdown(f"🏛️ **Börse:** {exchange} | 🏷️ **Status:** `{status}`")
-                st.markdown(f"💵 **Preisspanne:** {price if price else 'Offen'} $")
+                # Detail-Infos
+                st.markdown(f"🏛️ **Börse:** {exchange}  |  🏷️ **Status:** `{status}`")
                 
-                if pd.notna(shares) and shares > 0:
-                    st.markdown(f"📊 **Aktienvolumen:** {int(shares):,} Stück".replace(",", "."))
+                vol_str = f"{int(shares):,} Stück".replace(",", ".") if (pd.notna(shares) and shares > 0) else "Offen"
+                price_str = f"{price} $" if price else "Offen"
+                st.markdown(f"💵 **Preisspanne:** {price_str}  |  📊 **Volumen:** {vol_str}")
                 
+                # Direktlink für Underwriters / Konsortialbanken
                 if symbol and symbol != "-":
                     sa_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/"
                     st.markdown(f"🏦 [Konsortialbanken & Details auf Stock Analysis prüfen ↗]({sa_url})")
 
-# --- TAB 2: DE / EUROPA ---
+# --- TAB 2: DE / EUROPA (KARTEN-DESIGN MIT VOLLEM INFORMATIONSGEHALT) ---
 with tab_de:
-    st.subheader("Geplante Börsengänge (DE / EU)")
-    st.markdown("🔗 [Onvista IPO-Übersicht ↗](https://www.onvista.de/aktien/ipos) | [Börse Frankfurt Neuemissionen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
+    st.subheader("Börsengänge (DE / Europa)")
+    st.markdown("🔗 [Onvista IPO-Übersicht ↗](https://www.onvista.de/aktien/ipos)  |  [Börse Frankfurt Neuemissionen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
     
     df_de, source_name = get_de_ipos()
     if not df_de.empty:
         st.caption(f"Quelle: {source_name}")
-        st.dataframe(df_de, use_container_width=True, hide_index=True)
+        
+        for _, row in df_de.iterrows():
+            name = row.get("Name", "Unbekannt")
+            wkn = row.get("WKN", "-")
+            erstnotiz = row.get("Erstnotiz", "Offen")
+            emission = format_de_number(row.get("Emission"), "Mio. €")
+            kurs = format_de_number(row.get("Aktueller Kurs"), "€")
+            perf = str(row.get("Performance", "-")).strip()
+            
+            # Performance farblich hervorheben
+            if perf.startswith("-"):
+                perf_display = f"📉 :red[**{perf}**]"
+            elif perf not in ["-", "n.v.", "0,00%", "0,00 %"]:
+                perf_display = f"📈 :green[**+{perf}**]" if not perf.startswith("+") else f"📈 :green[**{perf}**]"
+            else:
+                perf_display = f"➖ **{perf}**"
+
+            with st.container(border=True):
+                # Kopfzeile: Name, WKN & Erstnotiz-Datum
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**{name}** (`WKN: {wkn}`)")
+                with col2:
+                    st.markdown(f"📅 **{erstnotiz}**")
+                
+                # Kennzahlen aus Tab 2 sauber aufbereitet
+                st.markdown(f"💰 **Emissionsvolumen:** {emission}")
+                st.markdown(f"💶 **Aktueller Kurs:** {kurs}  |  {perf_display}")
+                
+                # Direktlink zu Onvista über die WKN
+                if wkn and str(wkn) != "-":
+                    onvista_search_url = f"https://www.onvista.de/suche/{wkn}"
+                    st.markdown(f"🔍 [Kurs, Chart & Handelsplätze auf Onvista prüfen ↗]({onvista_search_url})")
     else:
-        st.info("Aktuell keine offenen Zeichnungsfristen in der DE-Tabelle gefunden – nutze die Direktlinks oben oder den DE-News-Ticker unten:")
+        st.info("Aktuell keine Tabellendaten verfügbar.")
     
     st.markdown("---")
     st.markdown("**🇩🇪 Aktuelle Meldungen zu deutschen & europäischen Börsengängen:**")
