@@ -4,6 +4,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
+import io
 
 # --- SEITEN-KONFIGURATION (Mobilfreundlich) ---
 st.set_page_config(
@@ -12,15 +13,15 @@ st.set_page_config(
     layout="centered"
 )
 
-# API Key sicher aus Streamlit Secrets laden (oder Fallback für lokalen Start)
+# API Key sicher aus Streamlit Secrets laden
 try:
     FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
 except Exception:
     FINNHUB_API_KEY = "dc03iq1r01qgh2a7ms80dc03iq1r01qgh2a7ms8g"
 
-# --- DATEN-FUNKTIONEN (Mit Caching für schnelle Ladezeiten auf dem Handy) ---
+# --- DATEN-FUNKTIONEN ---
 
-@st.cache_data(ttl=1800)  # Cache für 30 Minuten
+@st.cache_data(ttl=1800)
 def get_us_ipos(api_key):
     today = datetime.now().strftime("%Y-%m-%d")
     future = (datetime.now() + timedelta(days=45)).strftime("%Y-%m-%d")
@@ -33,7 +34,6 @@ def get_us_ipos(api_key):
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
-        # Chronologisch sortieren (früheste zuerst)
         if "date" in df.columns:
             df = df.sort_values(by="date", ascending=True)
         return df
@@ -41,46 +41,45 @@ def get_us_ipos(api_key):
         st.error(f"Fehler beim Laden der US-IPOs: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=3600)  # Cache für 1 Stunde
+@st.cache_data(ttl=3600)
 def get_onvista_ipos():
     url = "https://www.onvista.de/aktien/ipos"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        # Tabellen direkt mit pandas auslesen
-        tables = pd.read_html(response.text)
+        # Fix: io.StringIO verhindert den "File name too long"-Fehler in neueren Pandas-Versionen
+        tables = pd.read_html(io.StringIO(response.text))
         if tables:
             return tables[0]
         return pd.DataFrame()
     except Exception as e:
-        return pd.DataFrame({"Hinweis": [f"Onvista-Tabelle aktuell nicht direkt abrufbar ({e}). Bitte Link nutzen."]})
+        return pd.DataFrame({"Hinweis": [f"Onvista-Tabelle aktuell nicht direkt auslesbar ({e})."]})
 
-@st.cache_data(ttl=900)  # Cache für 15 Minuten
+@st.cache_data(ttl=900)
 def get_ipo_news():
-    # Onvista RSS-Feed für aktuelle Markt-News
-    rss_url = "https://www.onvista.de/news/feed/rss.xml"
-    keywords = ["ipo", "börsengang", "börsendebüt", "erstnotiz", "zeichnungsfrist", "emission", "aktienplatzierung"]
+    # Stabiler deutscher News-Feed (bündelt Onvista, Handelsblatt, dpa-AFX, Börse Online)
+    rss_url = "https://news.google.com/rss/search?q=B%C3%B6rsengang+OR+IPO+Aktie&hl=de&gl=DE&ceid=DE:de"
     news_items = []
     
     try:
         response = requests.get(rss_url, timeout=10)
+        response.raise_for_status()
         root = ET.fromstring(response.content)
-        for item in root.findall(".//item"):
+        for item in root.findall(".//item")[:20]:  # Die 20 aktuellsten Meldungen
             title = item.find("title").text if item.find("title") is not None else ""
             link = item.find("link").text if item.find("link") is not None else ""
             pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
-            desc = item.find("description").text if item.find("description") is not None else ""
+            source = item.find("source").text if item.find("source") is not None else "Börsen-News"
             
-            combined_text = (title + " " + desc).lower()
-            if any(kw in combined_text for kw in keywords):
-                news_items.append({
-                    "title": title,
-                    "link": link,
-                    "date": pub_date[:22]
-                })
+            news_items.append({
+                "title": title,
+                "link": link,
+                "date": pub_date[:22],
+                "source": source
+            })
         return news_items
     except Exception as e:
         st.error(f"News-Feed konnte nicht geladen werden: {e}")
@@ -105,7 +104,6 @@ with tab_us:
     if df_us.empty:
         st.info("Aktuell keine terminierten US-IPOs in den nächsten 45 Tagen gefunden.")
     else:
-        # Filter nach Status
         status_options = ["Alle"] + sorted(df_us["status"].dropna().unique().tolist())
         selected_status = st.selectbox("Status filtern:", status_options)
         
@@ -121,13 +119,11 @@ with tab_us:
             shares = row.get("numberOfShares", 0)
             status = row.get("status", "-")
             
-            # Datum schön formatieren
             try:
                 date_fmt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
             except Exception:
                 date_fmt = date_str
 
-            # Karten-Ansicht für das Smartphone
             with st.container(border=True):
                 col1, col2 = st.columns([3, 1])
                 with col1:
@@ -141,7 +137,6 @@ with tab_us:
                 if pd.notna(shares) and shares > 0:
                     st.markdown(f"📊 **Aktienvolumen:** {int(shares):,} Stück".replace(",", "."))
                 
-                # Direkter Link zu Stock Analysis für Underwriters / Konsortialbanken
                 if symbol and symbol != "-":
                     sa_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/"
                     st.markdown(f"🏦 [Konsortialbanken & Details auf Stock Analysis prüfen ↗]({sa_url})")
@@ -155,16 +150,16 @@ with tab_de:
     if not df_onvista.empty:
         st.dataframe(df_onvista, use_container_width=True, hide_index=True)
     else:
-        st.warning("Keine Tabellendaten gefunden.")
+        st.warning("Aktuell keine Tabellendaten auf Onvista gefunden.")
 
 # --- TAB 3: NEWS-TICKER ---
 with tab_news:
     st.subheader("Aktuelle IPO-Meldungen")
     news = get_ipo_news()
     if not news:
-        st.info("Aktuell keine spezifischen IPO-Schlagzeilen im dpa-AFX-Feed.")
+        st.info("Aktuell keine spezifischen IPO-Schlagzeilen gefunden.")
     else:
         for item in news:
             with st.container(border=True):
-                st.caption(item["date"])
+                st.caption(f"{item['source']} • {item['date']}")
                 st.markdown(f"**[{item['title']}]({item['link']})**")
