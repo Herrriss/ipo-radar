@@ -15,31 +15,65 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- KOMPAKTES MOBILE-LAYOUT (Mehr Platz oben & keine abgeschnittenen Tabs) ---
+# --- KOMPAKTES MOBILE-LAYOUT & ZWEIZEILIGE DROPDOWNS ---
 st.markdown("""
     <style>
         /* Oberen weißen Leerraum stark reduzieren */
         .block-container {
-            padding-top: 1.2rem !important;
+            padding-top: 1.1rem !important;
             padding-bottom: 2rem !important;
-            padding-left: 0.9rem !important;
-            padding-right: 0.9rem !important;
+            padding-left: 0.85rem !important;
+            padding-right: 0.85rem !important;
         }
         /* Streamlit-eigene Fork-/Toolbar-Leiste oben ausblenden */
         header[data-testid="stHeader"] {
             height: 0px !important;
             visibility: hidden;
         }
-        /* Hauptüberschrift kompakt & einzeilig auf dem Handy */
+        /* Hauptüberschrift kompakt & einzeilig */
         h1 {
             font-size: 1.65rem !important;
             padding-top: 0rem !important;
-            margin-bottom: 0.2rem !important;
+            margin-bottom: 0.15rem !important;
         }
-        /* Zweite Überschriften ("Kommende US-Börsengänge") etwas platzsparender */
         h2, h3 {
-            font-size: 1.25rem !important;
-            padding-top: 0.3rem !important;
+            font-size: 1.2rem !important;
+            padding-top: 0.25rem !important;
+        }
+        /* Spalten auch auf schmalen Handy-Screens nebeneinander halten */
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+            gap: 0.5rem !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            min-width: 0 !important;
+            flex: 1 1 0% !important;
+        }
+        /* Selectbox-Text zweizeilig umbrechen statt abschneiden */
+        div[data-baseweb="select"] > div {
+            min-height: 2.8rem !important;
+            height: auto !important;
+            padding-top: 4px !important;
+            padding-bottom: 4px !important;
+        }
+        div[data-baseweb="select"] div[class*="valueContainer"] > div,
+        div[data-baseweb="select"] span {
+            white-space: normal !important;
+            word-wrap: break-word !important;
+            overflow: visible !important;
+            text-overflow: unset !important;
+            line-height: 1.2 !important;
+            font-size: 0.85rem !important;
+        }
+        /* Dropdown-Menü-Optionen ebenfalls mehrzeilig erlauben */
+        ul[data-baseweb="menu"] li {
+            white-space: normal !important;
+            word-wrap: break-word !important;
+            line-height: 1.25 !important;
+            font-size: 0.88rem !important;
+            padding-top: 8px !important;
+            padding-bottom: 8px !important;
         }
     </style>
 """, unsafe_allow_html=True)
@@ -49,8 +83,8 @@ try:
 except Exception:
     FINNHUB_API_KEY = "dc03iq1r01qgh2a7ms80dc03iq1r01qgh2a7ms8g"
 
-# --- BEKANNTE DE / EU IPO-KANDIDATEN FÜR 2027 ---
-KNOWN_EU_2027_CANDIDATES = [
+# --- BEKANNTE DE / EU IPO-KANDIDATEN (2027 & DARÜBER HINAUS) ---
+KNOWN_EU_CANDIDATES = [
     {
         "name": "KNDS (Krauss-Maffei Wegmann + Nexter)",
         "wkn": "n/a",
@@ -126,7 +160,7 @@ def normalize_company_name(name):
     return s
 
 def extract_search_keywords_from_pipeline(us_list, de_list):
-    """Erstellt eine Liste der Kernnamen aller bereits in Tab 1 & Tab 2 gelisteten Unternehmen."""
+    """Erstellt eine Liste der Kernnamen aller bereits in US & DE/EU gelisteten Unternehmen."""
     keywords = set()
     for item in us_list + de_list:
         raw = item.get("name", "")
@@ -143,9 +177,10 @@ def extract_search_keywords_from_pipeline(us_list, de_list):
     return keywords
 
 def parse_sort_date(raw_val):
+    """Unbegrenzte Zukunftserkennung (2026, 2027, 2028, 2029+ sowie Quartale/Halbjahre)."""
     now = datetime.now()
     if pd.isna(raw_val) or str(raw_val).strip().lower() in ["", "-", "offen", "n/a", "none", "nan", "tbd", "unscheduled"]:
-        return now + timedelta(days=360), "n/a (Termin offen)"
+        return now + timedelta(days=1800), "n/a (Termin offen)"
     
     s = str(raw_val).strip()
     if re.fullmatch(r"\d{7,8}", s):
@@ -160,7 +195,9 @@ def parse_sort_date(raw_val):
             pass
             
     s_upper = s.upper()
-    year = 2027 if "2027" in s_upper else (2028 if "2028" in s_upper else now.year)
+    # Beliebige Jahreszahl (z. B. 2027, 2028, 2029, 2030) dynamisch auslesen
+    year_match = re.search(r"\b(20\d{2})\b", s_upper)
+    year = int(year_match.group(1)) if year_match else now.year
     
     if "H1" in s_upper:
         return datetime(year, 4, 15), f"~ {s} (geschätzt)"
@@ -169,18 +206,19 @@ def parse_sort_date(raw_val):
     for q, (m, d) in [("Q1", (2, 15)), ("Q2", (5, 15)), ("Q3", (8, 15)), ("Q4", (11, 15))]:
         if q in s_upper:
             return datetime(year, m, d), f"~ {s} (geschätzt)"
-    if s_upper in ["2027", "2028"]:
-        return datetime(int(s_upper), 6, 30), f"~ {s} (geschätzt)"
+    if year_match and s_upper == str(year):
+        return datetime(year, 6, 30), f"~ {s} (geschätzt)"
             
-    return now + timedelta(days=300), f"~ {s} (geschätzt)"
+    return now + timedelta(days=1500), f"~ {s} (geschätzt)"
 
-# --- DATEN-FUNKTIONEN (TAB 1 & TAB 2) ---
+# --- DATEN-FUNKTIONEN (US & DE/EU) ---
 
 @st.cache_data(ttl=1800)
 def get_us_ipos_full(api_key):
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    horizon_end = now + timedelta(days=180)
+    # Offen nach oben: 5 Jahre in die Zukunft statt 6 Monate
+    horizon_end = now + timedelta(days=1825)
     
     items = []
     seen_symbols = set()
@@ -242,7 +280,7 @@ def get_us_ipos_full(api_key):
                         price_col = cols.get("price range")
                         shares_col = cols.get("shares")
                         
-                        for _, row in t.head(30).iterrows():
+                        for _, row in t.head(40).iterrows():
                             raw_name = clean_val(row.get(name_col))
                             norm_name = normalize_company_name(raw_name)
                             sym = clean_val(row.get(cols["symbol"]))
@@ -323,7 +361,7 @@ def get_de_eu_ipos_full():
         except Exception:
             continue
 
-    for cand in KNOWN_EU_2027_CANDIDATES:
+    for cand in KNOWN_EU_CANDIDATES:
         norm_c = normalize_company_name(cand["name"])
         if norm_c in seen_names:
             continue
@@ -347,7 +385,6 @@ def get_de_eu_ipos_full():
 # --- NEWS-FUNKTIONEN & QUER-DEDUPLIZIERUNG ---
 
 def extract_topic_key(title):
-    """Erkennt den Haupt-Akteur in der Schlagzeile (auch bei Bindestrich-Komposita wie 'Anthropic-Börsengang')."""
     stopwords = {
         "aktien", "aktie", "börse", "börsengang", "ipo", "us", "usa", "dax",
         "nasdaq", "nyse", "markt", "märkte", "finanzen", "wirtschaft", "update",
@@ -357,7 +394,6 @@ def extract_topic_key(title):
         "markiert", "stürzt", "richtung", "ausgabekurs", "prozent", "minus", "plus",
         "today", "podcast", "ist", "anti", "proteste", "industrielle"
     }
-    # Bindestriche aufbrechen, damit aus "Anthropic-Börsengang" das Wort "Anthropic" extrahiert wird
     cleaned_title = re.sub(r"[-–—:]", " ", title)
     words = re.findall(r"\b[A-ZÄÖÜ][a-zA-Z0-9äöüÄÖÜß]{2,}\b", cleaned_title)
     for w in words:
@@ -456,7 +492,6 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
         "zeichnungsfrist", "emissionspreis", "ausgabekurs", "s-1", "going public", "float", "spinoff", "abspaltung"
     ]
     
-    # 1. Finnhub General Market News API
     try:
         fh_url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}"
         resp = requests.get(fh_url, timeout=8)
@@ -479,7 +514,6 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
     except Exception:
         pass
 
-    # 2. Direkte Wirtschafts-RSS-Feeds
     direct_feeds = [
         ("Handelsblatt", "https://www.handelsblatt.com/contentexport/feed/finanzen"),
         ("manager magazin", "https://www.manager-magazin.de/unternehmen/index.rss"),
@@ -489,7 +523,6 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
     for label, feed_url in direct_feeds:
         all_news.extend(parse_rss_feed(feed_url, label, cutoff_utc, title_keywords=ipo_title_keywords))
 
-    # 3. Streng gefiltertes Google News
     whitelist_query = (
         '(intitle:Börsengang OR intitle:IPO OR intitle:Börsenpläne OR intitle:Börsendebüt) '
         '(site:handelsblatt.com OR site:wiwo.de OR site:manager-magazin.de OR site:boersen-zeitung.de OR site:faz.net OR site:finanzen.net) '
@@ -501,7 +534,6 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
 
     all_news.sort(key=lambda x: x["pub_dt"], reverse=True)
     
-    # Erkennen, welche Unternehmen gerade frisch an die Börse gegangen sind
     recent_ipo_topics = set()
     for item in all_news:
         topic = extract_topic_key(item["title"])
@@ -548,32 +580,64 @@ def get_balanced_ipo_news(exclude_keywords, max_days=5):
 # --- BENUTZEROBERFLÄCHE ---
 
 st.title("🔭 IPO-Radar")
-st.caption(f"Stand: {datetime.now().strftime('%d.%m.%Y, %H:%M Uhr')} • Ausblick 6 Mon. & 2027")
+st.caption(f"Stand: {datetime.now().strftime('%d.%m.%Y, %H:%M Uhr')} • Ausblick 2026 – 2027+")
 
+# Daten vorab laden, damit die Filter direkt oben gerendert werden können
+us_ipos_all = get_us_ipos_full(FINNHUB_API_KEY)
+de_ipos_all = get_de_eu_ipos_full()
+pipeline_exclude_keywords = extract_search_keywords_from_pipeline(us_ipos_all, de_ipos_all)
+all_news = get_balanced_ipo_news(tuple(sorted(pipeline_exclude_keywords)), max_days=5)
+
+# Kompakte Tab-Navigation oben
+active_tab = st.radio(
+    "Ansicht wählen:",
+    ["🇺🇸 US-IPOs", "🇩🇪 DE / EU", "📰 News & Gerüchte"],
+    horizontal=True,
+    label_visibility="collapsed"
+)
+
+# --- DYNAMISCHE FILTER OBERHALB VON "DATEN AKTUALISIEREN" ---
+selected_us_status = "Alle"
+selected_news_cat = "Alle Quellen"
+selected_news_type = "Alle Kategorien"
+
+if active_tab == "🇺🇸 US-IPOs" and us_ipos_all:
+    all_statuses = sorted(list({item.get("status", "n/a") for item in us_ipos_all if item.get("status")}))
+    selected_us_status = st.selectbox("Phase / Status filtern:", ["Alle"] + all_statuses, key="us_filter_top")
+
+elif active_tab == "📰 News & Gerüchte" and all_news:
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        categories = ["Alle Quellen"] + sorted(list({n["category"] for n in all_news}))
+        selected_news_cat = st.selectbox("Quelle filtern:", categories, key="news_source_top")
+    with col_f2:
+        selected_news_type = st.selectbox(
+            "Kategorie filtern:",
+            [
+                "Alle Kategorien",
+                "🔥 Nur frische IPOs (max. 6)",
+                "🆕 Nur neue Kandidaten (max. 3)"
+            ],
+            key="news_type_top"
+        )
+
+# --- BUTTON: DATEN AKTUALISIEREN (UNTERHALB DER FILTER) ---
 if st.button("🔄 Daten aktualisieren", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-# Daten vorab laden, damit Tab 3 weiß, welche Unternehmen schon in Tab 1 & 2 abgedeckt sind
-us_ipos_all = get_us_ipos_full(FINNHUB_API_KEY)
-de_ipos_all = get_de_eu_ipos_full()
-pipeline_exclude_keywords = extract_search_keywords_from_pipeline(us_ipos_all, de_ipos_all)
+st.markdown("---")
 
-tab_us, tab_de, tab_news = st.tabs(["🇺🇸 US-IPOs", "🇩🇪 DE / EU", "📰 News & Gerüchte"])
-
-# --- TAB 1: US-IPOs ---
-with tab_us:
+# --- ANSICHT 1: US-IPOs ---
+if active_tab == "🇺🇸 US-IPOs":
     st.subheader("Kommende US-Börsengänge")
     us_ipos = us_ipos_all
     
     if not us_ipos:
-        st.info("Aktuell keine zukünftigen US-IPOs im 6-Monats-Fenster gemeldet.")
+        st.info("Aktuell keine zukünftigen US-IPOs gemeldet.")
     else:
-        all_statuses = sorted(list({item.get("status", "n/a") for item in us_ipos if item.get("status")}))
-        selected_status = st.selectbox("Phase / Status filtern:", ["Alle"] + all_statuses, key="us_filter")
-        
-        if selected_status != "Alle":
-            us_ipos = [i for i in us_ipos if i.get("status") == selected_status]
+        if selected_us_status != "Alle":
+            us_ipos = [i for i in us_ipos if i.get("status") == selected_us_status]
             
         st.caption(f"{len(us_ipos)} geplante US-Börsengänge in der Pipeline (chronologisch & ohne Duplikate):")
         
@@ -613,8 +677,8 @@ with tab_us:
                     else:
                         st.caption("Keine Meldungen gefunden – nutze den SEC- oder Stock-Analysis-Link oben.")
 
-# --- TAB 2: DE / EUROPA ---
-with tab_de:
+# --- ANSICHT 2: DE / EUROPA ---
+elif active_tab == "🇩🇪 DE / EU":
     st.subheader("Geplante Börsengänge (DE / Europa)")
     st.markdown("🔗 [Onvista IPO-Kandidaten ↗](https://www.onvista.de/aktien/ipos)  |  [Börse Frankfurt Zeichnungen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
     
@@ -648,29 +712,20 @@ with tab_de:
                 else:
                     st.caption("Keine aktuellen Meldungen gefunden.")
 
-# --- TAB 3: NUR NEUE GERÜCHTE & FRISCHE BÖRSENGÄNGE ---
-with tab_news:
+# --- ANSICHT 3: NUR NEUE GERÜCHTE & FRISCHE BÖRSENGÄNGE ---
+elif active_tab == "📰 News & Gerüchte":
     st.subheader("Neue Gerüchte & Frische IPOs (5 Tage)")
-    st.caption("Pipeline-Unternehmen aus Tab 1 & 2 sind ausgeblendet – Fokus auf neue Kandidaten (max. 3) & Nachkauf-Chancen nach Debüt (max. 6):")
-    
-    all_news = get_balanced_ipo_news(tuple(sorted(pipeline_exclude_keywords)), max_days=5)
+    st.caption("Pipeline-Unternehmen aus US & DE/EU sind ausgeblendet – Fokus auf neue Kandidaten (max. 3) & Nachkauf-Chancen (max. 6):")
     
     if not all_news:
-        st.info("In den letzten 5 Tagen gab es keine neuen Meldungen außerhalb deiner bestehenden Tab-1/Tab-2-Pipeline.")
+        st.info("In den letzten 5 Tagen gab es keine neuen Meldungen außerhalb deiner bestehenden Pipeline.")
     else:
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            categories = ["Alle Quellen"] + sorted(list({n["category"] for n in all_news}))
-            selected_cat = st.selectbox("Quelle filtern:", categories, key="news_source_filter")
-        with col_f2:
-            type_filter = st.selectbox("Kategorie filtern:", ["Alle", "🔥 Nur frische IPOs (max. 6)", "🆕 Nur neue Kandidaten & Gerüchte (max. 3)"])
-            
         filtered_news = all_news
-        if selected_cat != "Alle Quellen":
-            filtered_news = [n for n in filtered_news if n["category"] == selected_cat]
-        if type_filter == "🔥 Nur frische IPOs (max. 6)":
+        if selected_news_cat != "Alle Quellen":
+            filtered_news = [n for n in filtered_news if n["category"] == selected_news_cat]
+        if selected_news_type == "🔥 Nur frische IPOs (max. 6)":
             filtered_news = [n for n in filtered_news if "FRISCHES IPO" in n["topic_tag"]]
-        elif type_filter == "🆕 Nur neue Kandidaten & Gerüchte (max. 3)":
+        elif selected_news_type == "🆕 Nur neue Kandidaten (max. 3)":
             filtered_news = [n for n in filtered_news if "NEUER KANDIDAT" in n["topic_tag"]]
             
         for item in filtered_news:
