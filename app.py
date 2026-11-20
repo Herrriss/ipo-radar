@@ -298,10 +298,9 @@ def get_de_eu_ipos_full():
     items.sort(key=lambda x: x["sort_dt"])
     return items
 
-# --- MULTI-QUELLEN NEWS-AGGREGATOR (TAB 3 & RESEARCH) ---
+# --- NEWS-FUNKTIONEN ---
 
-def parse_rss_feed(url, source_label, cutoff_utc, filter_keywords=None, headers=None):
-    """Liest einen beliebigen RSS-Feed aus und filtert optional nach IPO-Begriffen."""
+def parse_rss_feed(url, source_label, cutoff_utc=None, filter_keywords=None, headers=None, lang_flag=""):
     results = []
     try:
         resp = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=8)
@@ -314,7 +313,6 @@ def parse_rss_feed(url, source_label, cutoff_utc, filter_keywords=None, headers=
             pub_raw = item.find("pubDate").text if item.find("pubDate") is not None else ""
             desc = item.find("description").text if item.find("description") is not None else ""
             
-            # Wenn ein eigener <source>-Tag im Feed existiert (z. B. Google News), diesen nutzen
             src_tag = item.find("source")
             actual_source = src_tag.text if (src_tag is not None and src_tag.text) else source_label
             
@@ -322,9 +320,10 @@ def parse_rss_feed(url, source_label, cutoff_utc, filter_keywords=None, headers=
                 pub_dt = parsedate_to_datetime(pub_raw)
                 if pub_dt.tzinfo is None:
                     pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-                if pub_dt < cutoff_utc:
+                if cutoff_utc and pub_dt < cutoff_utc:
                     continue
-                date_fmt = pub_dt.strftime("%d.%m.%Y, %H:%M Uhr")
+                date_fmt = pub_dt.strftime("%d.%m.%Y")
+                datetime_fmt = pub_dt.strftime("%d.%m.%Y, %H:%M Uhr")
             except Exception:
                 continue
                 
@@ -338,22 +337,51 @@ def parse_rss_feed(url, source_label, cutoff_utc, filter_keywords=None, headers=
                 "link": link.strip(),
                 "pub_dt": pub_dt,
                 "date_fmt": date_fmt,
+                "datetime_fmt": datetime_fmt,
                 "source": actual_source,
-                "category": source_label
+                "category": source_label,
+                "lang": lang_flag
             })
     except Exception:
         pass
     return results
 
+@st.cache_data(ttl=1800)
+def get_company_latest_3_news(company_name, symbol=""):
+    """
+    Holt die 3 aktuellsten Meldungen (in Deutsch UND Englisch) zum jeweiligen
+    Unternehmen – ohne künstliches 14-Tage-Limit, damit auch bei ruhigeren
+    Kandidaten immer die neuesten verfügbaren Infos angezeigt werden.
+    """
+    all_articles = []
+    
+    # 1. Deutschsprachige Suche
+    q_de = f'"{company_name}" (IPO OR Börsengang OR Aktie OR Börse)'
+    url_de = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_de)}&hl=de&gl=DE&ceid=DE:de"
+    all_articles.extend(parse_rss_feed(url_de, "DE-News", cutoff_utc=None, lang_flag="🇩🇪"))
+    
+    # 2. Englischsprachige Suche (wichtig für US-IPOs & internationale Filings)
+    sym_part = f' OR "{symbol}"' if (symbol and symbol != "n/a" and len(symbol) >= 3) else ""
+    q_en = f'("{company_name}"{sym_part}) (IPO OR "going public" OR "S-1" OR Nasdaq OR NYSE OR shares)'
+    url_en = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_en)}&hl=en-US&gl=US&ceid=US:en"
+    all_articles.extend(parse_rss_feed(url_en, "US/EN-News", cutoff_utc=None, lang_flag="🇺🇸"))
+    
+    # Deduplizieren & strikt chronologisch sortieren (aktuellste zuerst)
+    all_articles.sort(key=lambda x: x["pub_dt"], reverse=True)
+    unique = []
+    seen = set()
+    for art in all_articles:
+        clean_t = re.sub(r"[^a-zA-Z0-9äöüÄÖÜß ]", "", art["title"].lower())[:40]
+        if clean_t and clean_t not in seen:
+            seen.add(clean_t)
+            unique.append(art)
+            if len(unique) == 3:
+                break
+                
+    return unique
+
 @st.cache_data(ttl=900)
 def get_multi_source_ipo_news(max_days=5):
-    """
-    Kombiniert 4 hochwertige Wirtschafts- & Primärquellen für die letzten 5 Tage:
-    1. Finnhub Market News (Reuters, Bloomberg-Zusammenfassungen, CNBC, Seeking Alpha)
-    2. Handelsblatt & manager magazin (Direkte Wirtschafts-RSS-Feeds)
-    3. CNBC & MarketWatch (Direkte US-Finanz-RSS-Feeds)
-    4. Streng gefiltertes Google News (nur Qualitätsmedien + intitle:IPO/Börsengang)
-    """
     now_utc = datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(days=max_days)
     all_news = []
@@ -363,7 +391,6 @@ def get_multi_source_ipo_news(max_days=5):
         "zeichnungsfrist", "emissionspreis", "s-1", "going public", "float"
     ]
     
-    # 1. Finnhub General Market News API (englische Top-Finanzmedien)
     try:
         fh_url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}"
         resp = requests.get(fh_url, timeout=8)
@@ -380,14 +407,13 @@ def get_multi_source_ipo_news(max_days=5):
                         "title": headline,
                         "link": art.get("url", ""),
                         "pub_dt": pub_dt,
-                        "date_fmt": pub_dt.strftime("%d.%m.%Y, %H:%M Uhr"),
+                        "datetime_fmt": pub_dt.strftime("%d.%m.%Y, %H:%M Uhr"),
                         "source": art.get("source", "Finnhub Wire"),
                         "category": "Finnhub (US/Global)"
                     })
     except Exception:
         pass
 
-    # 2. Direkte Wirtschafts-RSS-Feeds (DE & US)
     direct_feeds = [
         ("Handelsblatt", "https://www.handelsblatt.com/contentexport/feed/finanzen"),
         ("manager magazin", "https://www.manager-magazin.de/unternehmen/index.rss"),
@@ -397,7 +423,6 @@ def get_multi_source_ipo_news(max_days=5):
     for label, feed_url in direct_feeds:
         all_news.extend(parse_rss_feed(feed_url, label, cutoff_utc, filter_keywords=ipo_keywords))
 
-    # 3. Streng gefiltertes Google News (Whitelist seriöser Medien + intitle-Zwang)
     whitelist_query = (
         '(intitle:Börsengang OR intitle:IPO) '
         '(site:handelsblatt.com OR site:wiwo.de OR site:manager-magazin.de OR site:boersen-zeitung.de OR site:faz.net OR site:finanzen.net) '
@@ -407,7 +432,6 @@ def get_multi_source_ipo_news(max_days=5):
     gn_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(whitelist_query)}&hl=de&gl=DE&ceid=DE:de"
     all_news.extend(parse_rss_feed(gn_url, "Wirtschaftspresse (DE)", cutoff_utc))
 
-    # Deduplizierung über bereinigten Titel-Anfang & chronologische Sortierung
     unique_news = []
     seen_prefixes = set()
     all_news.sort(key=lambda x: x["pub_dt"], reverse=True)
@@ -420,15 +444,6 @@ def get_multi_source_ipo_news(max_days=5):
             unique_news.append(item)
             
     return unique_news[:30]
-
-@st.cache_data(ttl=900)
-def get_company_specific_news(company_name, max_days=14):
-    """Gezielte Unternehmens-News für die Research-Boxen in Tab 1 & Tab 2."""
-    now_utc = datetime.now(timezone.utc)
-    cutoff_utc = now_utc - timedelta(days=max_days)
-    q = f'"{company_name}" (IPO OR Börsengang) when:{max_days}d'
-    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=de&gl=DE&ceid=DE:de"
-    return parse_rss_feed(url, "News", cutoff_utc)[:3]
 
 # --- BENUTZEROBERFLÄCHE ---
 
@@ -477,7 +492,7 @@ with tab_us:
                 st.markdown(f"💵 **Preisspanne:** {price}  |  📊 **Volumen:** {shares}")
                 
                 with st.expander("🔍 Unternehmens- & Markt-Research"):
-                    clean_company = name.replace("Inc.", "").replace("Corp.", "").replace("Ltd.", "").strip()
+                    clean_company = re.sub(r"\b(Inc|Corp|Corporation|Ltd|Limited|LLC|PLC|Holdings|Group)\.?", "", name).strip()
                     links = []
                     if symbol != "n/a":
                         links.append(f"[Stock Analysis (Finanzen & Underwriters) ↗](https://stockanalysis.com/stocks/{symbol.lower()}/)")
@@ -485,13 +500,13 @@ with tab_us:
                     links.append(f"[Google News ↗](https://news.google.com/search?q={urllib.parse.quote(clean_company + ' IPO')})")
                     st.markdown(" • ".join(links))
                     
-                    st.markdown(f"**Meldungen der letzten 14 Tage zu {clean_company}:**")
-                    company_news = get_company_specific_news(clean_company, max_days=14)
+                    st.markdown(f"**Die 3 aktuellsten Meldungen zu {clean_company} (DE / EN):**")
+                    company_news = get_company_latest_3_news(clean_company, symbol=symbol)
                     if company_news:
                         for n in company_news:
-                            st.markdown(f"- [{n['title']}]({n['link']}) *({n['source']}, {n['date_fmt']})*")
+                            st.markdown(f"- {n['lang']} [{n['title']}]({n['link']}) *({n['source']}, {n['date_fmt']})*")
                     else:
-                        st.caption("Keine deutschsprachigen News in den letzten 14 Tagen – nutze die Links oben für US-Filings.")
+                        st.caption("Keine Meldungen gefunden – nutze den SEC- oder Stock-Analysis-Link oben.")
 
 # --- TAB 2: DE / EUROPA ---
 with tab_de:
@@ -517,16 +532,16 @@ with tab_de:
                 links = []
                 if item["wkn"] != "n/a":
                     links.append(f"[Onvista Zeichnungsdetails ↗](https://www.onvista.de/suche/{item['wkn']})")
-                links.append(f"[Aktuelle News suchen ↗](https://news.google.com/search?q={urllib.parse.quote(clean_de_name + ' Börsengang')})")
+                links.append(f"[Google News ↗](https://news.google.com/search?q={urllib.parse.quote(clean_de_name + ' Börsengang')})")
                 st.markdown(" • ".join(links))
                 
-                st.markdown(f"**Aktuelle Meldungen (letzte 14 Tage) zu {clean_de_name}:**")
-                c_news = get_company_specific_news(clean_de_name, max_days=14)
+                st.markdown(f"**Die 3 aktuellsten Meldungen zu {clean_de_name} (DE / EN):**")
+                c_news = get_company_latest_3_news(clean_de_name)
                 if c_news:
                     for n in c_news:
-                        st.markdown(f"- [{n['title']}]({n['link']}) *({n['source']}, {n['date_fmt']})*")
+                        st.markdown(f"- {n['lang']} [{n['title']}]({n['link']}) *({n['source']}, {n['date_fmt']})*")
                 else:
-                    st.caption("Keine neuen Meldungen in den letzten 14 Tagen.")
+                    st.caption("Keine aktuellen Meldungen gefunden.")
 
 # --- TAB 3: MULTI-QUELLEN WIRTSCHAFTS-NEWS (LETZTE 5 TAGE) ---
 with tab_news:
@@ -538,7 +553,6 @@ with tab_news:
     if not all_news:
         st.info("In den letzten 5 Tagen gab es keine neuen IPO-Meldungen in den angeschlossenen Wirtschaftsmedien.")
     else:
-        # Quellen-Filter direkt über den Nachrichten
         categories = ["Alle Quellen"] + sorted(list({n["category"] for n in all_news}))
         selected_cat = st.selectbox("Quelle filtern:", categories, key="news_source_filter")
         
@@ -546,5 +560,5 @@ with tab_news:
         
         for item in filtered_news:
             with st.container(border=True):
-                st.caption(f"📰 **{item['source']}** ({item['category']}) • {item['date_fmt']}")
+                st.caption(f"📰 **{item['source']}** ({item['category']}) • {item['datetime_fmt']}")
                 st.markdown(f"**[{item['title']}]({item['link']})**")
