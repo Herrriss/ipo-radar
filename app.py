@@ -43,7 +43,6 @@ def get_us_ipos(api_key):
 
 @st.cache_data(ttl=3600)
 def get_de_ipos():
-    # Wir versuchen zuerst boerse.de (meist ohne 403-Sperre) und nutzen realistische Browser-Header
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -51,27 +50,26 @@ def get_de_ipos():
         "Referer": "https://www.google.de/"
     }
     
-    # Quelle 1: boerse.de IPO-Kalender
-    try:
-        resp = requests.get("https://www.boerse.de/ipos/", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            tables = pd.read_html(io.StringIO(resp.text))
-            for t in tables:
-                if len(t.columns) >= 3 and len(t) > 0:
-                    return t, "boerse.de"
-    except Exception:
-        pass
-
-    # Quelle 2: finanzen.net IPO-Kalender als Backup
-    try:
-        resp = requests.get("https://www.finanzen.net/ipo/", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            tables = pd.read_html(io.StringIO(resp.text))
-            for t in tables:
-                if len(t.columns) >= 3 and len(t) > 0:
-                    return t, "finanzen.net"
-    except Exception:
-        pass
+    # Begriffe, die in einer echten IPO-Tabelle als Spaltenkopf vorkommen müssen (verhindert Seitenleisten-Tabellen wie BCDI)
+    ipo_headers = ["wkn", "isin", "termin", "emissions", "zeichnungs", "erstnotiz", "status", "preisspanne"]
+    
+    sources = [
+        ("boerse.de", "https://www.boerse.de/ipos/"),
+        ("finanzen.net", "https://www.finanzen.net/ipo/")
+    ]
+    
+    for source_name, url in sources:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                tables = pd.read_html(io.StringIO(resp.text))
+                for t in tables:
+                    cols_str = " ".join([str(c).lower() for c in t.columns])
+                    # Nur Tabellen akzeptieren, die echte IPO-Spaltenüberschriften haben
+                    if any(h in cols_str for h in ipo_headers) and len(t) > 0:
+                        return t, source_name
+        except Exception:
+            continue
 
     return pd.DataFrame(), None
 
@@ -160,14 +158,14 @@ with tab_us:
 # --- TAB 2: DE / EUROPA ---
 with tab_de:
     st.subheader("Geplante Börsengänge (DE / EU)")
-    st.markdown("🔗 [Onvista IPO-Übersicht öffnen ↗](https://www.onvista.de/aktien/ipos) | [Börse Frankfurt Neuemissionen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
+    st.markdown("🔗 [Onvista IPO-Übersicht ↗](https://www.onvista.de/aktien/ipos) | [Börse Frankfurt Neuemissionen ↗](https://live.deutsche-boerse.com/aktien/neuemissionen)")
     
     df_de, source_name = get_de_ipos()
     if not df_de.empty:
         st.caption(f"Quelle: {source_name}")
         st.dataframe(df_de, use_container_width=True, hide_index=True)
     else:
-        st.info("Direkte Tabellendaten werden aktuell durch Firewall geschützt – nutze die Schnell-Links oben oder die gefilterten DE-IPO-News unten:")
+        st.info("Aktuell keine offenen Zeichnungsfristen in der DE-Tabelle gefunden – nutze die Direktlinks oben oder den DE-News-Ticker unten:")
     
     st.markdown("---")
     st.markdown("**🇩🇪 Aktuelle Meldungen zu deutschen & europäischen Börsengängen:**")
